@@ -1,11 +1,3 @@
-/******************************************************************************
-
-                              Online C++ Compiler.
-               Code, Compile, Run and Debug C++ program online.
-Write your code in this editor and press "Run" button to compile and execute it.
-
-*******************************************************************************/
-
 #include <iostream>
 #include <thread>
 #include <set>
@@ -16,6 +8,7 @@ Write your code in this editor and press "Run" button to compile and execute it.
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <algorithm>
+#include <sys/select.h>
 
 std::set<std::string> peerList; // Stores active peers
 std::mutex peerMutex; // Synchronization for peer list
@@ -56,44 +49,63 @@ void receiveMessages() {
 
     std::cout << "Server listening on port " << myPort << "...\n";
 
+    fd_set masterSet, readSet;
+    FD_ZERO(&masterSet);
+    FD_SET(serverSock, &masterSet);
+    int maxFd = serverSock;
+
     while (true) {
-        struct sockaddr_in clientAddr = {};
-        socklen_t addrSize = sizeof(clientAddr);
-        int clientSock = accept(serverSock, (struct sockaddr*)&clientAddr, &addrSize);
-        if (clientSock == -1) {
-            std::cerr << "Failed to accept connection.\n";
+        readSet = masterSet;
+        if (select(maxFd + 1, &readSet, NULL, NULL, NULL) < 0) {
+            std::cerr << "select() failed.\n";
             continue;
         }
 
-        char buffer[1024] = {0};
-        recv(clientSock, buffer, sizeof(buffer), 0);
+        if (FD_ISSET(serverSock, &readSet)) {
+            struct sockaddr_in clientAddr = {};
+            socklen_t addrSize = sizeof(clientAddr);
+            int clientSock = accept(serverSock, (struct sockaddr*)&clientAddr, &addrSize);
+            if (clientSock == -1) {
+                std::cerr << "Failed to accept connection.\n";
+                continue;
+            }
 
-        std::string senderIP = inet_ntoa(clientAddr.sin_addr);
-        std::string message(buffer);
+            char buffer[1024] = {0};
+            recv(clientSock, buffer, sizeof(buffer), 0);
 
-        // Extract peer info from message format "<IP:PORT> <team name> <message>"
-        size_t firstSpace = message.find(' ');
-        size_t secondSpace = message.find(' ', firstSpace + 1);
+            std::string senderIP = inet_ntoa(clientAddr.sin_addr);
+            std::string message(buffer);
 
-        std::string peerInfo = message.substr(0, firstSpace);
-        std::string teamNameReceived = message.substr(firstSpace + 1, secondSpace - firstSpace - 1);
-        std::string actualMessage = message.substr(secondSpace + 1);
+            // Extract peer info from message format "<IP:PORT> <team name> <message>"
+            size_t firstSpace = message.find(' ');
+            size_t secondSpace = message.find(' ', firstSpace + 1);
 
-        // Store the peer info
-        {
-            std::lock_guard<std::mutex> lock(peerMutex);
-            peerList.insert(peerInfo);
+            std::string peerInfo = message.substr(0, firstSpace);
+            std::string teamNameReceived = message.substr(firstSpace + 1, secondSpace - firstSpace - 1);
+            std::string actualMessage = message.substr(secondSpace + 1);
+
+            // Store or remove peer info
+            {
+                std::lock_guard<std::mutex> lock(peerMutex);
+                if (actualMessage == "exit") {
+                    peerList.erase(peerInfo);
+                } else {
+                    peerList.insert(peerInfo);
+                }
+            }
+
+            // Store peer's team name
+            {
+                std::lock_guard<std::mutex> lock(teamNameMutex);
+                if (actualMessage != "exit") {
+                    peerTeamNames[peerInfo] = teamNameReceived;
+                }
+            }
+
+            std::cout << "\nReceived from [" << peerInfo << "] (" << teamNameReceived << "): " << actualMessage << "\n";
+
+            close(clientSock);
         }
-
-        // Store the peer's team name
-        {
-            std::lock_guard<std::mutex> lock(teamNameMutex);
-            peerTeamNames[peerInfo] = teamNameReceived;
-        }
-
-        std::cout << "\nReceived from [" << peerInfo << "] (" << teamNameReceived << "): " << actualMessage << "\n";
-
-        close(clientSock);
     }
 }
 
@@ -169,7 +181,7 @@ int main() {
     serverThread.detach();
 
     while (true) {
-        std::cout << "\n*** Menu ***\n";
+        std::cout << "\n** Menu **\n";
         std::cout << "1. Send message\n";
         std::cout << "2. Query active peers\n";
         std::cout << "3. Connect to active peers\n";
@@ -190,10 +202,6 @@ int main() {
             std::cout << "Enter your message: ";
             std::getline(std::cin, message);
             sendMessage(ip, port, message);
-
-            sendMessage(SERVER1_IP, SERVER1_PORT, message);
-            sendMessage(SERVER2_IP, SERVER2_PORT, message);
-
         } else if (choice == 2) {
             showPeers();
         } else if (choice == 3) {
@@ -205,6 +213,8 @@ int main() {
             std::cin >> port;
             connectToPeer(ip, port);
         } else if (choice == 0) {
+            sendMessage(SERVER1_IP, SERVER1_PORT, "exit");
+            sendMessage(SERVER2_IP, SERVER2_PORT, "exit");
             std::cout << "Exiting...\n";
             break;
         } else {
