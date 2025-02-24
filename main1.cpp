@@ -1,3 +1,11 @@
+/******************************************************************************
+
+                              Online C++ Compiler.
+               Code, Compile, Run and Debug C++ program online.
+Write your code in this editor and press "Run" button to compile and execute it.
+
+*******************************************************************************/
+
 #include <iostream>
 #include <thread>
 #include <set>
@@ -13,6 +21,7 @@
 std::set<std::string> peerList; // Stores active peers
 std::mutex peerMutex; // Synchronization for peer list
 std::map<std::string, std::string> peerTeamNames; // Stores peer's team names
+std::map<std::string, int> peerSockets; // Stores peer socket file descriptors
 std::mutex teamNameMutex; // Synchronization for peer team names
 
 std::string teamName; // Stores the team name
@@ -76,7 +85,6 @@ void receiveMessages() {
             std::string senderIP = inet_ntoa(clientAddr.sin_addr);
             std::string message(buffer);
 
-            // Extract peer info from message format "<IP:PORT> <team name> <message>"
             size_t firstSpace = message.find(' ');
             size_t secondSpace = message.find(' ', firstSpace + 1);
 
@@ -84,32 +92,29 @@ void receiveMessages() {
             std::string teamNameReceived = message.substr(firstSpace + 1, secondSpace - firstSpace - 1);
             std::string actualMessage = message.substr(secondSpace + 1);
 
-            // Store or remove peer info
+            // Handle peer info
             {
                 std::lock_guard<std::mutex> lock(peerMutex);
-                if (actualMessage == "exit") {
+                if (actualMessage == "quit") {
                     peerList.erase(peerInfo);
+                    peerSockets.erase(peerInfo);
+                    std::lock_guard<std::mutex> teamLock(teamNameMutex);
+                    peerTeamNames.erase(peerInfo);
+                    std::cout << "\nPeer " << peerInfo << " (" << teamNameReceived << ") has disconnected.\n";
                 } else {
                     peerList.insert(peerInfo);
-                }
-            }
-
-            // Store peer's team name
-            {
-                std::lock_guard<std::mutex> lock(teamNameMutex);
-                if (actualMessage != "exit") {
+                    peerSockets[peerInfo] = clientSock;
+                    std::lock_guard<std::mutex> teamLock(teamNameMutex);
                     peerTeamNames[peerInfo] = teamNameReceived;
+                    std::cout << "\nReceived from [" << peerInfo << "] (" << teamNameReceived << "): " << actualMessage << "\n";
                 }
             }
-
-            std::cout << "\nReceived from [" << peerInfo << "] (" << teamNameReceived << "): " << actualMessage << "\n";
 
             close(clientSock);
         }
     }
 }
 
-// Function to send a message to a peer
 void sendMessage(const std::string& ip, int port, const std::string& message) {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock == -1) {
@@ -136,7 +141,36 @@ void sendMessage(const std::string& ip, int port, const std::string& message) {
     close(sock);
 }
 
-// Function to display active peers sorted by team names
+void sendToAll(const std::string& message) {
+    std::lock_guard<std::mutex> lock(peerMutex);
+    if (peerList.empty()) {
+        std::cout << "No peers connected to send message.\n";
+        return;
+    }
+
+    for (const std::string& peer : peerList) {
+        size_t colonPos = peer.find(':');
+        std::string ipAddress = peer.substr(1, colonPos - 1);
+        int port = std::stoi(peer.substr(colonPos + 1, peer.length() - colonPos - 2));
+
+        sendMessage(ipAddress, port, message);
+    }
+}
+
+void exitAndNotifyPeers() {
+    std::lock_guard<std::mutex> lock(peerMutex);
+    for (const auto& peer : peerList) {
+        size_t colonPos = peer.find(':');
+        std::string ipAddress = peer.substr(1, colonPos - 1);
+        int port = std::stoi(peer.substr(colonPos + 1, peer.length() - colonPos - 2));
+        sendMessage(ipAddress, port, "quit");
+    }
+    // Clear the peer list after notifying all peers
+    peerList.clear();
+    peerSockets.clear();
+    peerTeamNames.clear();
+}
+
 void showPeers() {
     std::lock_guard<std::mutex> lock(peerMutex);
     std::vector<std::pair<std::string, std::string> > sortedPeers;
@@ -154,7 +188,7 @@ void showPeers() {
         std::sort(sortedPeers.begin(), sortedPeers.end());
 
         std::cout << "Connected Peers (Sorted by Team Name):\n";
-        for (const std::pair<std::string, std::string>& peerPair : sortedPeers) {
+        for (const auto& peerPair : sortedPeers) {
             size_t colonPos = peerPair.second.find(':');
             std::string ipAddress = peerPair.second.substr(1, colonPos - 1);
             std::string portNumber = peerPair.second.substr(colonPos + 1, peerPair.second.length() - colonPos - 2);
@@ -164,13 +198,11 @@ void showPeers() {
     }
 }
 
-// Function to connect to a peer
 void connectToPeer(const std::string& ip, int port) {
     std::cout << "Attempting to connect to " << ip << ":" << port << "...\n";
     sendMessage(ip, port, "CONNECT");
 }
 
-// Main function with user interaction
 int main() {
     std::cout << "Enter your name: ";
     std::cin >> teamName;
@@ -182,9 +214,10 @@ int main() {
 
     while (true) {
         std::cout << "\n** Menu **\n";
-        std::cout << "1. Send message\n";
-        std::cout << "2. Query active peers\n";
-        std::cout << "3. Connect to active peers\n";
+        std::cout << "1. Send message to an individual\n";
+        std::cout << "2. Send message to all connected peers\n";
+        std::cout << "3. Query active peers\n";
+        std::cout << "4. Connect to a peer\n";
         std::cout << "0. Quit\n";
         std::cout << "Enter choice: ";
 
@@ -203,22 +236,25 @@ int main() {
             std::getline(std::cin, message);
             sendMessage(ip, port, message);
         } else if (choice == 2) {
-            showPeers();
+            std::cin.ignore();
+            std::cout << "Enter your message: ";
+            std::string message;
+            std::getline(std::cin, message);
+            sendToAll(message);
         } else if (choice == 3) {
+            showPeers();
+        } else if (choice == 4) {
             std::string ip;
             int port;
-            std::cout << "Enter peer's IP address to connect: ";
+            std::cout << "Enter peer's IP address: ";
             std::cin >> ip;
             std::cout << "Enter peer's port number: ";
             std::cin >> port;
             connectToPeer(ip, port);
         } else if (choice == 0) {
-            sendMessage(SERVER1_IP, SERVER1_PORT, "exit");
-            sendMessage(SERVER2_IP, SERVER2_PORT, "exit");
             std::cout << "Exiting...\n";
+            exitAndNotifyPeers();
             break;
-        } else {
-            std::cout << "Invalid option. Try again.\n";
         }
     }
 
